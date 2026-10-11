@@ -7,6 +7,7 @@ import errno
 import os
 import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -242,16 +243,19 @@ class CommandRunner:
                 stdout=slave_fd,
                 stderr=slave_fd,
                 close_fds=True,
+                **_process_group_popen_kwargs(),
             )
         except OSError as exc:
+            os.close(slave_fd)
+            os.close(master_fd)
             result = _result_from_os_error(argv, cwd_path, exc)
             if check and not result.ok:
                 raise CommandError(result) from exc
             return result
-        finally:
-            os.close(slave_fd)
 
         try:
+            os.close(slave_fd)
+            slave_fd = None
             while True:
                 try:
                     chunk = os.read(master_fd, 4096)
@@ -305,6 +309,7 @@ class CommandRunner:
         stderr_tail: deque[str] = deque(maxlen=tail_lines)
         stdout_count = [0]
         stderr_count = [0]
+        threads: list[threading.Thread] = []
         try:
             process = subprocess.Popen(
                 argv,
@@ -315,6 +320,7 @@ class CommandRunner:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                **_process_group_popen_kwargs(),
             )
         except OSError as exc:
             result = _result_from_os_error(argv, cwd_path, exc)
@@ -322,28 +328,28 @@ class CommandRunner:
                 raise CommandError(result) from exc
             return result
 
-        threads = [
-            threading.Thread(
-                target=_stream_pipe,
-                args=(process.stdout, sys.stdout, stdout_tail, stdout_count),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=_stream_pipe,
-                args=(process.stderr, sys.stderr, stderr_tail, stderr_count),
-                daemon=True,
-            ),
-        ]
-        for thread in threads:
-            thread.start()
         try:
+            threads = [
+                threading.Thread(
+                    target=_stream_pipe,
+                    args=(process.stdout, sys.stdout, stdout_tail, stdout_count),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=_stream_pipe,
+                    args=(process.stderr, sys.stderr, stderr_tail, stderr_count),
+                    daemon=True,
+                ),
+            ]
+            for thread in threads:
+                thread.start()
             returncode = process.wait()
             for thread in threads:
                 thread.join()
         except BaseException:
             _terminate_interrupted_process(process)
             for thread in threads:
-                thread.join()
+                thread.join(timeout=INTERRUPTED_PROCESS_GRACE_SECONDS)
             raise
 
         result = CommandResult(
@@ -419,6 +425,14 @@ def normalize_args(args: Sequence[CommandArg]) -> tuple[str, ...]:
     return tuple(os.fspath(arg) for arg in args)
 
 
+def _process_group_popen_kwargs() -> dict[str, object]:
+    """Start commands in their own group so interruption reaches descendants."""
+
+    if os.name == "posix":
+        return {"start_new_session": True}
+    return {}
+
+
 def display_command(args: Sequence[CommandArg]) -> str:
     return shlex.join(normalize_args(args))
 
@@ -447,19 +461,57 @@ def _terminate_interrupted_process(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         return
 
+    _signal_process(process, signal.SIGTERM, process.terminate)
+
     try:
-        process.terminate()
+        _wait_ignoring_keyboard_interrupt(
+            process,
+            timeout=INTERRUPTED_PROCESS_GRACE_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        _signal_process(
+            process,
+            getattr(signal, "SIGKILL", signal.SIGTERM),
+            process.kill,
+        )
+        _wait_ignoring_keyboard_interrupt(process)
+
+
+def _signal_process(
+    process: subprocess.Popen,
+    signum: int,
+    fallback: object,
+) -> None:
+    """Signal a process group on POSIX, with a direct-process fallback."""
+
+    if os.name == "posix" and isinstance(getattr(process, "pid", None), int):
+        try:
+            os.killpg(os.getpgid(process.pid), signum)
+            return
+        except OSError:
+            pass
+    try:
+        fallback()
     except OSError:
         pass
 
-    try:
-        process.wait(timeout=INTERRUPTED_PROCESS_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
+
+def _wait_ignoring_keyboard_interrupt(
+    process: subprocess.Popen,
+    *,
+    timeout: float | None = None,
+) -> None:
+    """Wait until a child is reaped, even if cleanup is interrupted again."""
+
+    while True:
         try:
-            process.kill()
-        except OSError:
-            pass
-        process.wait()
+            if timeout is None:
+                process.wait()
+            else:
+                process.wait(timeout=timeout)
+            return
+        except KeyboardInterrupt:
+            continue
 
 
 class _TextTail:

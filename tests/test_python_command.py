@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from wudup.command import (
     CommandError,
     CommandResult,
     CommandRunner,
+    _terminate_interrupted_process,
 )
 
 
@@ -285,6 +287,9 @@ class CommandRunnerTests(unittest.TestCase):
 
         process_mock.terminate.assert_called_once()
         process_mock.kill.assert_not_called()
+        process_mock.wait.assert_has_calls(
+            [mock.call(), mock.call(timeout=2.0)],
+        )
         close_mock.assert_has_calls([mock.call(11), mock.call(10)], any_order=True)
 
     @mock.patch("wudup.command.subprocess.Popen")
@@ -335,6 +340,9 @@ class CommandRunnerTests(unittest.TestCase):
 
         process_mock.terminate.assert_called_once()
         process_mock.kill.assert_not_called()
+        process_mock.wait.assert_has_calls(
+            [mock.call(), mock.call(timeout=2.0)],
+        )
 
     @mock.patch("wudup.command.subprocess.Popen")
     def test_run_streaming_kills_child_if_termination_times_out(
@@ -347,7 +355,9 @@ class CommandRunnerTests(unittest.TestCase):
         process_mock.poll.return_value = None
         process_mock.wait.side_effect = [
             KeyboardInterrupt,
+            KeyboardInterrupt,
             subprocess.TimeoutExpired(cmd=("streaming_command",), timeout=2),
+            KeyboardInterrupt,
             0,
         ]
         popen_mock.return_value = process_mock
@@ -361,6 +371,33 @@ class CommandRunnerTests(unittest.TestCase):
 
         process_mock.terminate.assert_called_once()
         process_mock.kill.assert_called_once()
+        process_mock.wait.assert_has_calls(
+            [
+                mock.call(),
+                mock.call(timeout=2.0),
+                mock.call(timeout=2.0),
+                mock.call(),
+                mock.call(),
+            ],
+        )
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX-only")
+    @mock.patch("wudup.command.os.killpg")
+    @mock.patch("wudup.command.os.getpgid", return_value=4321)
+    def test_interrupted_cleanup_signals_process_group(
+        self,
+        getpgid_mock: mock.Mock,
+        killpg_mock: mock.Mock,
+    ) -> None:
+        process_mock = mock.Mock(pid=1234)
+        process_mock.poll.return_value = None
+        process_mock.wait.return_value = 0
+
+        _terminate_interrupted_process(process_mock)
+
+        getpgid_mock.assert_called_once_with(1234)
+        killpg_mock.assert_called_once_with(4321, signal.SIGTERM)
+        process_mock.terminate.assert_not_called()
 
     @mock.patch("wudup.command.subprocess.run")
     def test_cwd_and_env_passing(self, run_mock: mock.Mock) -> None:
