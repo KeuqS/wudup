@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - Windows fallback.
 CommandArg = str | os.PathLike[str]
 STREAM_TAIL_LINES = 200
 MAX_WINSIZE_VALUE = 65535
+INTERRUPTED_PROCESS_GRACE_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -233,24 +234,24 @@ class CommandRunner:
 
         _copy_terminal_size(slave_fd, sys.stdout)
         try:
-            try:
-                process = subprocess.Popen(
-                    argv,
-                    cwd=str(cwd_path) if cwd_path is not None else None,
-                    env=self._merged_env(env),
-                    stdin=subprocess.DEVNULL,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    close_fds=True,
-                )
-            except OSError as exc:
-                result = _result_from_os_error(argv, cwd_path, exc)
-                if check and not result.ok:
-                    raise CommandError(result) from exc
-                return result
-            finally:
-                os.close(slave_fd)
+            process = subprocess.Popen(
+                argv,
+                cwd=str(cwd_path) if cwd_path is not None else None,
+                env=self._merged_env(env),
+                stdin=subprocess.DEVNULL,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
+            )
+        except OSError as exc:
+            result = _result_from_os_error(argv, cwd_path, exc)
+            if check and not result.ok:
+                raise CommandError(result) from exc
+            return result
+        finally:
+            os.close(slave_fd)
 
+        try:
             while True:
                 try:
                     chunk = os.read(master_fd, 4096)
@@ -268,6 +269,9 @@ class CommandRunner:
             returncode = process.wait()
             tail.feed(decoder.decode(b"", final=True))
             tail.close()
+        except BaseException:
+            _terminate_interrupted_process(process)
+            raise
         finally:
             os.close(master_fd)
 
@@ -332,9 +336,15 @@ class CommandRunner:
         ]
         for thread in threads:
             thread.start()
-        returncode = process.wait()
-        for thread in threads:
-            thread.join()
+        try:
+            returncode = process.wait()
+            for thread in threads:
+                thread.join()
+        except BaseException:
+            _terminate_interrupted_process(process)
+            for thread in threads:
+                thread.join()
+            raise
 
         result = CommandResult(
             args=argv,
@@ -429,6 +439,27 @@ def _stream_pipe(
             target.flush()
         except OSError:
             pass
+
+
+def _terminate_interrupted_process(process: subprocess.Popen) -> None:
+    """Stop and reap a child after the caller was interrupted."""
+
+    if process.poll() is not None:
+        return
+
+    try:
+        process.terminate()
+    except OSError:
+        pass
+
+    try:
+        process.wait(timeout=INTERRUPTED_PROCESS_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait()
 
 
 class _TextTail:
