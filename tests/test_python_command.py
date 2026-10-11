@@ -11,6 +11,7 @@ from wudup.command import (
     CommandError,
     CommandResult,
     CommandRunner,
+    _signal_process,
     _terminate_interrupted_process,
 )
 
@@ -259,6 +260,29 @@ class CommandRunnerTests(unittest.TestCase):
 
     @mock.patch("wudup.command.os.close")
     @mock.patch("wudup.command.subprocess.Popen")
+    def test_run_in_pty_returns_error_when_child_cannot_start(
+        self,
+        popen_mock: mock.Mock,
+        close_mock: mock.Mock,
+    ) -> None:
+        import wudup.command
+
+        if getattr(wudup.command, "pty", None) is None:
+            self.skipTest("pty not available on this platform")
+
+        popen_mock.side_effect = FileNotFoundError("missing command")
+        with (
+            mock.patch("wudup.command.pty.openpty", return_value=(10, 11)),
+            mock.patch("wudup.command._copy_terminal_size"),
+        ):
+            result = CommandRunner().run_in_pty(["missing"], check=False)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.returncode, 127)
+        close_mock.assert_has_calls([mock.call(11), mock.call(10)], any_order=True)
+
+    @mock.patch("wudup.command.os.close")
+    @mock.patch("wudup.command.subprocess.Popen")
     def test_run_in_pty_terminates_child_when_interrupted(
         self,
         popen_mock: mock.Mock,
@@ -398,6 +422,40 @@ class CommandRunnerTests(unittest.TestCase):
         getpgid_mock.assert_called_once_with(1234)
         killpg_mock.assert_called_once_with(4321, signal.SIGTERM)
         process_mock.terminate.assert_not_called()
+
+    def test_interrupted_cleanup_skips_already_exited_process(self) -> None:
+        process_mock = mock.Mock()
+        process_mock.poll.return_value = 0
+
+        _terminate_interrupted_process(process_mock)
+
+        process_mock.terminate.assert_not_called()
+        process_mock.kill.assert_not_called()
+        process_mock.wait.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX-only")
+    @mock.patch("wudup.command.os.killpg", side_effect=OSError("group is gone"))
+    @mock.patch("wudup.command.os.getpgid", return_value=4321)
+    def test_signal_process_falls_back_when_group_signal_fails(
+        self,
+        getpgid_mock: mock.Mock,
+        killpg_mock: mock.Mock,
+    ) -> None:
+        process_mock = mock.Mock(pid=1234)
+
+        _signal_process(process_mock, signal.SIGTERM, process_mock.terminate)
+
+        getpgid_mock.assert_called_once_with(1234)
+        killpg_mock.assert_called_once_with(4321, signal.SIGTERM)
+        process_mock.terminate.assert_called_once_with()
+
+    def test_signal_process_ignores_fallback_oserror(self) -> None:
+        process_mock = mock.Mock(pid=None)
+        fallback = mock.Mock(side_effect=OSError("already gone"))
+
+        _signal_process(process_mock, signal.SIGTERM, fallback)
+
+        fallback.assert_called_once_with()
 
     @mock.patch("wudup.command.subprocess.run")
     def test_cwd_and_env_passing(self, run_mock: mock.Mock) -> None:
