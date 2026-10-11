@@ -76,8 +76,14 @@ class CommandError(RuntimeError):
 class CommandRunner:
     """Small subprocess wrapper with explicit argv lists and optional base env."""
 
-    def __init__(self, env: Mapping[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        env: Mapping[str, str] | None = None,
+        *,
+        isolate_process_group: bool = False,
+    ) -> None:
         self._env = dict(env) if env is not None else None
+        self._isolate_process_group = isolate_process_group
 
     def capture(
         self,
@@ -243,7 +249,7 @@ class CommandRunner:
                 stdout=slave_fd,
                 stderr=slave_fd,
                 close_fds=True,
-                **_process_group_popen_kwargs(),
+                **_process_group_popen_kwargs(self._isolate_process_group),
             )
         except OSError as exc:
             os.close(slave_fd)
@@ -274,7 +280,10 @@ class CommandRunner:
             tail.feed(decoder.decode(b"", final=True))
             tail.close()
         except BaseException:
-            _terminate_interrupted_process(process)
+            _terminate_interrupted_process(
+                process,
+                process_group=self._isolate_process_group,
+            )
             raise
         finally:
             os.close(master_fd)
@@ -320,7 +329,7 @@ class CommandRunner:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-                **_process_group_popen_kwargs(),
+                **_process_group_popen_kwargs(self._isolate_process_group),
             )
         except OSError as exc:
             result = _result_from_os_error(argv, cwd_path, exc)
@@ -347,7 +356,10 @@ class CommandRunner:
             for thread in threads:
                 thread.join()
         except BaseException:
-            _terminate_interrupted_process(process)
+            _terminate_interrupted_process(
+                process,
+                process_group=self._isolate_process_group,
+            )
             for thread in threads:
                 thread.join(timeout=INTERRUPTED_PROCESS_GRACE_SECONDS)
             raise
@@ -425,10 +437,10 @@ def normalize_args(args: Sequence[CommandArg]) -> tuple[str, ...]:
     return tuple(os.fspath(arg) for arg in args)
 
 
-def _process_group_popen_kwargs() -> dict[str, object]:
-    """Start commands in their own group so interruption reaches descendants."""
+def _process_group_popen_kwargs(isolate_process_group: bool) -> dict[str, object]:
+    """Return POSIX isolation options when interruption must include descendants."""
 
-    if os.name == "posix":
+    if isolate_process_group and os.name == "posix":
         return {"start_new_session": True}
     return {}
 
@@ -455,13 +467,22 @@ def _stream_pipe(
             pass
 
 
-def _terminate_interrupted_process(process: subprocess.Popen) -> None:
+def _terminate_interrupted_process(
+    process: subprocess.Popen,
+    *,
+    process_group: bool = False,
+) -> None:
     """Stop and reap a child after the caller was interrupted."""
 
     if process.poll() is not None:
         return
 
-    _signal_process(process, signal.SIGTERM, process.terminate)
+    _signal_process(
+        process,
+        signal.SIGTERM,
+        process.terminate,
+        process_group=process_group,
+    )
 
     try:
         _wait_ignoring_keyboard_interrupt(
@@ -473,6 +494,7 @@ def _terminate_interrupted_process(process: subprocess.Popen) -> None:
             process,
             getattr(signal, "SIGKILL", signal.SIGTERM),
             process.kill,
+            process_group=process_group,
         )
         _wait_ignoring_keyboard_interrupt(process)
 
@@ -481,12 +503,16 @@ def _signal_process(
     process: subprocess.Popen,
     signum: int,
     fallback: object,
+    *,
+    process_group: bool = False,
 ) -> None:
     """Signal a process group on POSIX, with a direct-process fallback."""
 
-    if os.name == "posix" and isinstance(getattr(process, "pid", None), int):
+    if process_group and os.name == "posix" and isinstance(
+        getattr(process, "pid", None), int
+    ):
         try:
-            os.killpg(os.getpgid(process.pid), signum)
+            os.killpg(process.pid, signum)
             return
         except OSError:
             pass

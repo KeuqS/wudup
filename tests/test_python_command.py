@@ -332,6 +332,26 @@ class CommandRunnerTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.stdout, "out1\nout2\n")
         self.assertEqual(result.stderr, "err1\n")
+        self.assertNotIn("start_new_session", popen_mock.call_args.kwargs)
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX-only")
+    @mock.patch("wudup.command.subprocess.Popen")
+    def test_isolated_runner_starts_new_session(
+        self,
+        popen_mock: mock.Mock,
+    ) -> None:
+        process_mock = mock.Mock()
+        process_mock.stdout = []
+        process_mock.stderr = []
+        process_mock.wait.return_value = 0
+        popen_mock.return_value = process_mock
+
+        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            CommandRunner(isolate_process_group=True).run_streaming(
+                ["streaming_command"]
+            )
+
+        self.assertTrue(popen_mock.call_args.kwargs["start_new_session"])
 
     @mock.patch("wudup.command.subprocess.Popen")
     def test_run_streaming_oserror(self, popen_mock: mock.Mock) -> None:
@@ -407,20 +427,17 @@ class CommandRunnerTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "process groups are POSIX-only")
     @mock.patch("wudup.command.os.killpg")
-    @mock.patch("wudup.command.os.getpgid", return_value=4321)
     def test_interrupted_cleanup_signals_process_group(
         self,
-        getpgid_mock: mock.Mock,
         killpg_mock: mock.Mock,
     ) -> None:
         process_mock = mock.Mock(pid=1234)
         process_mock.poll.return_value = None
         process_mock.wait.return_value = 0
 
-        _terminate_interrupted_process(process_mock)
+        _terminate_interrupted_process(process_mock, process_group=True)
 
-        getpgid_mock.assert_called_once_with(1234)
-        killpg_mock.assert_called_once_with(4321, signal.SIGTERM)
+        killpg_mock.assert_called_once_with(1234, signal.SIGTERM)
         process_mock.terminate.assert_not_called()
 
     def test_interrupted_cleanup_skips_already_exited_process(self) -> None:
@@ -435,18 +452,20 @@ class CommandRunnerTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "process groups are POSIX-only")
     @mock.patch("wudup.command.os.killpg", side_effect=OSError("group is gone"))
-    @mock.patch("wudup.command.os.getpgid", return_value=4321)
     def test_signal_process_falls_back_when_group_signal_fails(
         self,
-        getpgid_mock: mock.Mock,
         killpg_mock: mock.Mock,
     ) -> None:
         process_mock = mock.Mock(pid=1234)
 
-        _signal_process(process_mock, signal.SIGTERM, process_mock.terminate)
+        _signal_process(
+            process_mock,
+            signal.SIGTERM,
+            process_mock.terminate,
+            process_group=True,
+        )
 
-        getpgid_mock.assert_called_once_with(1234)
-        killpg_mock.assert_called_once_with(4321, signal.SIGTERM)
+        killpg_mock.assert_called_once_with(1234, signal.SIGTERM)
         process_mock.terminate.assert_called_once_with()
 
     def test_signal_process_ignores_fallback_oserror(self) -> None:
